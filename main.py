@@ -1,33 +1,40 @@
-"""CLI-Einstiegspunkt: analysiert ein Video auf Outlines, Tags und Movement."""
+"""CLI-Einstiegspunkt: analysiert ein Video auf rote Outlines, Tags und Movement."""
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 import cv2
 
 from src.capture import VideoSource
 from src.movement import MovementDetector
-from src.outlines import OutlineDetector
+from src.outlines import RedOutlineDetector
 from src.pipeline import DetectionPipeline
 from src.tags import TagDetector
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Outlines / Tags / Movement im Video erkennen.")
+    p = argparse.ArgumentParser(description="Rote Outlines / Tags / Movement im Video erkennen.")
     p.add_argument("--video", required=True, help="Pfad zur Videodatei")
     p.add_argument("--skip", type=int, default=1, help="Nur jeden N-ten Frame analysieren")
     p.add_argument("--no-ocr", action="store_true", help="OCR (Tags) abschalten – schneller")
     p.add_argument("--gpu", action="store_true", help="EasyOCR auf der GPU laufen lassen")
     p.add_argument("--save", help="Annotiertes Ergebnis als Videodatei speichern")
     p.add_argument("--no-window", action="store_true", help="Kein Vorschaufenster anzeigen")
+    p.add_argument("--show-solid", action="store_true",
+                   help="Massive rote Objekte mit anzeigen (orange) statt verwerfen")
+    p.add_argument("--bench", action="store_true",
+                   help="Pro Frame die reine Detection-Zeit (ms) ausgeben")
 
-    # Outline-Farbe (HSV). Default = kräftiges Grün.
-    p.add_argument("--hsv-lower", type=int, nargs=3, metavar=("H", "S", "V"),
-                   default=[40, 80, 80], help="Untere HSV-Grenze der Outline-Farbe")
-    p.add_argument("--hsv-upper", type=int, nargs=3, metavar=("H", "S", "V"),
-                   default=[80, 255, 255], help="Obere HSV-Grenze der Outline-Farbe")
+    # Outline-Trennung & Geschwindigkeit
+    p.add_argument("--fill-ratio", type=float, default=0.35,
+                   help="Max. Rot-Anteil in der Box, damit es als Outline gilt (0..1)")
+    p.add_argument("--downscale", type=float, default=1.0,
+                   help="Frame vor Outline-Analyse verkleinern (z. B. 0.5 = schneller)")
+    p.add_argument("--min-area", type=int, default=120,
+                   help="Mindestfläche einer Kontur in Pixel²")
     return p.parse_args(argv)
 
 
@@ -35,15 +42,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     pipeline = DetectionPipeline(
-        outline_detector=OutlineDetector(
-            lower=tuple(args.hsv_lower), upper=tuple(args.hsv_upper)
+        outline_detector=RedOutlineDetector(
+            min_area=args.min_area,
+            max_fill_ratio=args.fill_ratio,
+            downscale=args.downscale,
         ),
         movement_detector=MovementDetector(),
         tag_detector=TagDetector(gpu=args.gpu),
         use_ocr=not args.no_ocr,
+        outlines_only=not args.show_solid,
     )
 
     writer = None
+    n_frames = 0
+    total_ms = 0.0
     try:
         with VideoSource(args.video, skip=args.skip) as src:
             if args.save:
@@ -53,7 +65,16 @@ def main(argv: list[str] | None = None) -> int:
                 writer = cv2.VideoWriter(args.save, fourcc, fps, (w, h))
 
             for frame in src:
+                t0 = time.perf_counter()
                 result = pipeline.process(frame)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                n_frames += 1
+                total_ms += dt_ms
+                if args.bench:
+                    print(f"Frame {n_frames}: {dt_ms:6.2f} ms  "
+                          f"(outlines={len(result.outlines)}, "
+                          f"moves={len(result.movements)}, tags={len(result.tags)})")
+
                 annotated = pipeline.draw(frame, result)
 
                 if writer is not None:
@@ -71,6 +92,10 @@ def main(argv: list[str] | None = None) -> int:
             writer.release()
         cv2.destroyAllWindows()
 
+    if n_frames:
+        avg = total_ms / n_frames
+        print(f"\nØ {avg:.2f} ms/Frame über {n_frames} Frames "
+              f"(~{1000.0 / avg:.0f} FPS möglich).")
     return 0
 
 
