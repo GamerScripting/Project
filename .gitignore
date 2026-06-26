@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Daten / Outputs
+*.mp4
+*.avi
+*.mov
+*.mkv
+out/
+output/
+
+# EasyOCR Modelle (werden automatisch geladen)
+.EasyOCR/
+
+# IDE
+.idea/
+.vscode/
