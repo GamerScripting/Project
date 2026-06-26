@@ -68,13 +68,14 @@ class DetectionPipeline:
             result.tags = self.tags.detect(frame)
         return result
 
-    def draw(self, frame: np.ndarray, result: FrameResult) -> np.ndarray:
+    def draw(self, frame: np.ndarray, result: FrameResult, show_movement: bool = False) -> np.ndarray:
         """Zeichnet alle Erkennungen als Overlay auf eine Kopie des Frames."""
         out = frame.copy()
 
-        for m in result.movements:
-            x, y, w, h = m.box
-            cv2.rectangle(out, (x, y), (x + w, y + h), self.COLOR_MOVE, 1)
+        if show_movement:
+            for m in result.movements:
+                x, y, w, h = m.box
+                cv2.rectangle(out, (x, y), (x + w, y + h), self.COLOR_MOVE, 1)
 
         for o in result.outlines:
             x, y, w, h = o.box

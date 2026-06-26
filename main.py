@@ -24,8 +24,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Höchstens N Frames verarbeiten (gut zum Tunen großer Dateien)")
     p.add_argument("--no-ocr", action="store_true", help="OCR (Tags) abschalten – schneller")
     p.add_argument("--gpu", action="store_true", help="EasyOCR auf der GPU laufen lassen")
+    p.add_argument("--cuda", action="store_true",
+                   help="Outline-Detection auf der NVIDIA-GPU (CUDA) beschleunigen")
     p.add_argument("--save", help="Annotiertes Ergebnis als Videodatei speichern")
     p.add_argument("--no-window", action="store_true", help="Kein Vorschaufenster anzeigen")
+    p.add_argument("--no-movement", action="store_true", help="Bewegungsboxen nicht anzeigen")
     p.add_argument("--show-solid", action="store_true",
                    help="Massive rote Objekte mit anzeigen (orange) statt verwerfen")
     p.add_argument("--bench", action="store_true",
@@ -54,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             max_fill_ratio=args.fill_ratio,
             downscale=args.downscale,
             roi=tuple(args.roi) if args.roi else None,
+            use_cuda=args.cuda,
         ),
         movement_detector=MovementDetector(),
         tag_detector=TagDetector(gpu=args.gpu),
@@ -85,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
                           f"(outlines={len(result.outlines)}, "
                           f"moves={len(result.movements)}, tags={len(result.tags)})")
 
-                annotated = pipeline.draw(frame, result)
+                annotated = pipeline.draw(frame, result, show_movement=not args.no_movement)
 
                 if writer is not None:
                     writer.write(annotated)
