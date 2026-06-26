@@ -19,6 +19,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Rote Outlines / Tags / Movement im Video erkennen.")
     p.add_argument("--video", required=True, help="Pfad zur Videodatei")
     p.add_argument("--skip", type=int, default=1, help="Nur jeden N-ten Frame analysieren")
+    p.add_argument("--start", type=float, default=0.0, help="Bei Sekunde X ins Video einsteigen")
+    p.add_argument("--max-frames", type=int, default=None,
+                   help="Höchstens N Frames verarbeiten (gut zum Tunen großer Dateien)")
     p.add_argument("--no-ocr", action="store_true", help="OCR (Tags) abschalten – schneller")
     p.add_argument("--gpu", action="store_true", help="EasyOCR auf der GPU laufen lassen")
     p.add_argument("--save", help="Annotiertes Ergebnis als Videodatei speichern")
@@ -57,7 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     n_frames = 0
     total_ms = 0.0
     try:
-        with VideoSource(args.video, skip=args.skip) as src:
+        with VideoSource(args.video, skip=args.skip,
+                         start_sec=args.start, max_frames=args.max_frames) as src:
             if args.save:
                 w, h = src.size
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")

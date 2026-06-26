@@ -18,18 +18,30 @@ class VideoSource:
                 ...
     """
 
-    def __init__(self, path: str | Path, skip: int = 1) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        skip: int = 1,
+        start_sec: float = 0.0,
+        max_frames: int | None = None,
+    ) -> None:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"Video nicht gefunden: {self.path}")
         # Nur jeden `skip`-ten Frame liefern (>=1). Spart Rechenzeit.
         self.skip = max(1, skip)
+        # An welcher Sekunde einsteigen (Seek) und wie viele Frames max. liefern.
+        # Praktisch beim Tunen großer Dateien – nicht jedes Mal alles durchlaufen.
+        self.start_sec = max(0.0, start_sec)
+        self.max_frames = max_frames
         self.cap: cv2.VideoCapture | None = None
 
     def __enter__(self) -> "VideoSource":
         self.cap = cv2.VideoCapture(str(self.path))
         if not self.cap.isOpened():
             raise RuntimeError(f"Video konnte nicht geöffnet werden: {self.path}")
+        if self.start_sec > 0:
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, self.start_sec * 1000.0)
         return self
 
     def __exit__(self, *exc) -> None:
@@ -56,10 +68,14 @@ class VideoSource:
         if self.cap is None:
             raise RuntimeError("VideoSource muss als Context-Manager genutzt werden.")
         index = 0
+        yielded = 0
         while True:
+            if self.max_frames is not None and yielded >= self.max_frames:
+                break
             ok, frame = self.cap.read()
             if not ok:
                 break
             if index % self.skip == 0:
                 yield frame
+                yielded += 1
             index += 1
