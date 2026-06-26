@@ -19,6 +19,20 @@ class FrameResult:
     outlines: list[OutlineDetection] = field(default_factory=list)
     tags: list[TagDetection] = field(default_factory=list)
     movements: list[MovementRegion] = field(default_factory=list)
+    frame_id: int = 0
+
+    def to_dict(self) -> dict:
+        """Kompaktes Dict – genau das, was später über LAN an PC2 geht."""
+        return {
+            "frame": self.frame_id,
+            "outlines": [o.to_dict() for o in self.outlines],
+            "movements": [m.to_dict() for m in self.movements],
+            "tags": [t.to_dict() for t in self.tags],
+        }
+
+    def to_json(self) -> str:
+        import json
+        return json.dumps(self.to_dict(), separators=(",", ":"))
 
 
 class DetectionPipeline:

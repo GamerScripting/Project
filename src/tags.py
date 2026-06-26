@@ -20,6 +20,14 @@ class TagDetection:
         x, y, w, h = self.box
         return (x + w // 2, y + h // 2)
 
+    def to_dict(self) -> dict:
+        return {
+            "text": self.text,
+            "box": list(self.box),
+            "center": list(self.center),
+            "conf": round(self.confidence, 3),
+        }
+
 
 class TagDetector:
     """Erkennt Text in Frames mittels EasyOCR.

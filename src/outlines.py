@@ -32,6 +32,14 @@ class OutlineDetection:
         x, y, w, h = self.box
         return (x + w // 2, y + h // 2)
 
+    def to_dict(self) -> dict:
+        """Kompakte, sendbare Darstellung (ohne die schwere Kontur)."""
+        return {
+            "box": list(self.box),
+            "center": list(self.center),
+            "fill": round(self.fill_ratio, 3),
+        }
+
 
 class RedOutlineDetector:
     """Findet rote Outlines und trennt sie von massiven roten Objekten.

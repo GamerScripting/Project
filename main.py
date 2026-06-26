@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = pipeline.process(frame)
                 dt_ms = (time.perf_counter() - t0) * 1000.0
                 n_frames += 1
+                result.frame_id = n_frames
                 total_ms += dt_ms
                 if args.bench:
                     print(f"Frame {n_frames}: {dt_ms:6.2f} ms  "

@@ -20,6 +20,9 @@ class MovementRegion:
         x, y, w, h = self.box
         return (x + w // 2, y + h // 2)
 
+    def to_dict(self) -> dict:
+        return {"box": list(self.box), "center": list(self.center)}
+
 
 class MovementDetector:
     """Erkennt Bewegung durch Vergleich aufeinanderfolgender Frames.
