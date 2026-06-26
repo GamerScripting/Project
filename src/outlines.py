@@ -1,14 +1,24 @@
-"""Erkennung farbiger (roter/pink) Umrandungen via HSV-Farbfilter.
+"""Erkennung dünner roter/pinker Charakter-Outlines (Gegner-Glow).
 
-Besonderheiten:
-- Rot liegt in HSV an beiden Enden des Hue-Kreises (~0 und ~180), deshalb
-  werden ZWEI Farbbereiche kombiniert.
-- Echte Outlines werden von massiven roten Objekten über die *Füllrate*
-  unterschieden: Eine Outline ist ein dünner Rand um einen nicht-roten
-  Innenbereich (wenig rote Pixel in der Box), ein rotes Objekt ist fast
-  vollständig rot gefüllt.
-- GPU-Beschleunigung via PyTorch (torch.cuda) wenn verfügbar, sonst
-  cv2.cuda, sonst CPU-Fallback.
+Ansatz = FARBE + FORM, optimiert auf DÜNNE Linien:
+
+1. Farb-Maske (HSV, zwei Rot-Bereiche wegen Hue-Wrap) klassifiziert jeden
+   Pixel als "Outline-Farbe" oder nicht.  ->  `core`-Maske (dünn, roh)
+2. KEINE Erosion/Opening!  Ein Opening mit 3x3-Kernel löscht eine 2-px-Linie
+   komplett aus – genau das, was wir behalten wollen.  Stattdessen ein
+   CLOSE, das die (durch Crosshair/Text/Effekte) zerrissene Outline wieder
+   zu EINEM zusammenhängenden Silhouetten-Loop verbindet.  ->  `connected`
+3. Konturen auf `connected`; pro Kandidat entscheiden FORM-Merkmale, ob es
+   ein Charakter ist:
+     - Seitenverhältnis (ein Mensch ist hoch, kein breiter HUD-Balken)
+     - Größe (kein Mini-Rauschen, nicht der halbe Bildschirm)
+     - Thinness / Füllrate (eine OUTLINE ist eine dünne Linie, keine
+       "fette Ummantellung" = massiv rot gefülltes Objekt).  Gemessen auf
+       der `core`-Maske, damit das CLOSE die Füllrate nicht verfälscht.
+
+GPU: Nur die (teure) Farb-Klassifikation läuft via PyTorch/cv2.cuda auf der
+GPU; Morphologie + findContours sind auf der binären Maske billig und laufen
+auf der CPU (cv2.findContours hat ohnehin kein CUDA).
 """
 
 from __future__ import annotations
@@ -27,53 +37,43 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# GPU-Hilfsfunktionen (PyTorch)
+# GPU-Hilfsfunktion: BGR -> HSV (OpenCV-Maßstab) auf der GPU
 # ---------------------------------------------------------------------------
 
 def _bgr_to_hsv_torch(bgr: "torch.Tensor") -> "torch.Tensor":
-    """BGR-uint8-Tensor (H,W,3) auf GPU → HSV im OpenCV-Maßstab (H:0-180, S/V:0-255)."""
+    """BGR-uint8-Tensor (H,W,3) -> HSV (H:0-180, S/V:0-255) als float-Tensor."""
     b = bgr[:, :, 0].float() / 255.0
     g = bgr[:, :, 1].float() / 255.0
     r = bgr[:, :, 2].float() / 255.0
-    rgb = torch.stack([r, g, b], 2)
-    maxc = rgb.max(2).values
-    minc = rgb.min(2).values
+    maxc = torch.max(torch.max(r, g), b)
+    minc = torch.min(torch.min(r, g), b)
     diff = maxc - minc
-    v = maxc
-    s = torch.where(maxc > 1e-6, diff / maxc, torch.zeros_like(maxc))
-    h = torch.zeros_like(maxc)
     eps = 1e-6
+    s = torch.where(maxc > eps, diff / (maxc + eps), torch.zeros_like(maxc))
+    h = torch.zeros_like(maxc)
     mr = (maxc == r) & (diff > eps)
     mg = (maxc == g) & (diff > eps) & ~mr
-    mb = ~mr & ~mg & (diff > eps)
-    h[mr] = ((g - b) / (diff + eps))[mr] % 6
-    h[mg] = ((b - r) / (diff + eps) + 2)[mg]
-    h[mb] = ((r - g) / (diff + eps) + 4)[mb]
-    h = (h * 30) % 180
-    return torch.stack([h, s * 255, v * 255], 2)
-
-
-def _morph_open_torch(mask: "torch.Tensor", ksize: int = 3) -> "torch.Tensor":
-    """Binäres Opening (Erosion→Dilation) auf einem 2-D GPU-Float-Tensor."""
-    m = mask.float().unsqueeze(0).unsqueeze(0)
-    p = ksize // 2
-    m = -_F.max_pool2d(-m, ksize, stride=1, padding=p)   # erosion
-    m = _F.max_pool2d(m, ksize, stride=1, padding=p)     # dilation
-    return m.squeeze(0).squeeze(0)
+    mb = (diff > eps) & ~mr & ~mg
+    h[mr] = (((g - b) / (diff + eps)) % 6)[mr]
+    h[mg] = (((b - r) / (diff + eps)) + 2)[mg]
+    h[mb] = (((r - g) / (diff + eps)) + 4)[mb]
+    h = (h * 30.0) % 180.0          # OpenCV-Hue: 0..180
+    return torch.stack([h, s * 255.0, maxc * 255.0], dim=2)
 
 
 # ---------------------------------------------------------------------------
-# Datenklassen
+# Datenklasse
 # ---------------------------------------------------------------------------
 
 @dataclass
 class OutlineDetection:
-    """Ein erkanntes rotes Element."""
+    """Ein erkannter Gegner-Outline / Charakter-Kandidat."""
 
-    box: tuple[int, int, int, int]   # x, y, w, h (in Originalauflösung)
-    area: float                      # Fläche der Kontur (Pixel²)
-    fill_ratio: float                # Anteil roter Pixel in der Box (0..1)
-    is_outline: bool                 # True = Outline, False = massives Objekt
+    box: tuple[int, int, int, int]   # x, y, w, h (Originalauflösung)
+    area: float                      # Bounding-Box-Fläche (Pixel², Original)
+    fill_ratio: float                # roter Pixel-Anteil in der Box (Thinness)
+    aspect: float                    # Höhe / Breite
+    is_outline: bool                 # immer True (Kandidat hat Filter bestanden)
     contour: np.ndarray = field(default=None, repr=False)
 
     @property
@@ -86,6 +86,7 @@ class OutlineDetection:
             "box": list(self.box),
             "center": list(self.center),
             "fill": round(self.fill_ratio, 3),
+            "aspect": round(self.aspect, 2),
         }
 
 
@@ -94,57 +95,86 @@ class OutlineDetection:
 # ---------------------------------------------------------------------------
 
 class RedOutlineDetector:
-    """Findet rote/pinke Charakter-Outlines (z. B. Marvel Rivals Gegner-Glow).
+    """Findet dünne rote/pinke Charakter-Outlines (Farbe + Form).
 
-    GPU-Beschleunigung:
-        use_cuda=True aktiviert automatisch PyTorch-CUDA wenn verfügbar,
-        danach cv2.cuda als Fallback, dann CPU.
-        Tipp: pip install torch --index-url https://download.pytorch.org/whl/cu124
+    HSV-Farbe (Default auf den Gegner-Glow abgestimmt):
+        Bereich 1 (Rot/Coral/Orange-Seite):  H 0-14
+        Bereich 2 (Pink/Magenta-Seite):      H 150-180
+        S >= 60, V >= 110  (heller, gesättigter Leucht-Rand;
+        S-Untergrenze niedrig genug für den weichen Glow)
 
-    HSV-Standardwerte (angepasst auf den Charakter-Outline-Glow):
-        Hue  0-12  (Rot/Coral-Seite) und 155-180 (Pink/Magenta-Seite)
-        Sat  70+   (niedriger Wert fängt den weichen Glow-Effekt)
-        Val  140+  (hell/leuchtend)
+    Form-Filter (das "Form"-Teil von Farbe+Form):
+        aspect_range:  erlaubtes Höhe/Breite-Verhältnis (Mensch ist hoch);
+                       blockt breite HUD-Balken & horizontale Linien.
+        min_area / max_area_frac:  Größenfenster der Bounding-Box.
+        max_fill_ratio:  obere Schranke für den roten Pixel-Anteil – eine
+                         dünne Outline füllt die Box kaum; eine "fette
+                         Ummantellung" (massiv rotes Objekt) wird verworfen.
+        min_fill_ratio:  es muss überhaupt eine Linie da sein.
+
+    Verbindung:
+        connect_ksize / connect_iter steuern das CLOSE, das die zerrissene
+        Outline zu einem zusammenhängenden Loop verbindet.
+
+    GPU:
+        use_cuda=True -> PyTorch-CUDA, sonst cv2.cuda, sonst CPU.
+        pip install torch --index-url https://download.pytorch.org/whl/cu124
     """
 
     def __init__(
         self,
-        # Salmon/Coral-Rot (untere Hue-Seite) – breiter Bereich für Glow
-        lower1: tuple[int, int, int] = (0,   70, 140),
-        upper1: tuple[int, int, int] = (12, 255, 255),
-        # Pink/Magenta (obere Hue-Seite)
-        lower2: tuple[int, int, int] = (155,  70, 140),
+        # --- Farbe (HSV) ---
+        lower1: tuple[int, int, int] = (0,   60, 110),
+        upper1: tuple[int, int, int] = (14, 255, 255),
+        lower2: tuple[int, int, int] = (150,  60, 110),
         upper2: tuple[int, int, int] = (180, 255, 255),
-        min_area: int = 150,
-        max_fill_ratio: float = 0.35,
+        # --- Form ---
+        min_area: int = 350,                 # min. Bounding-Box-Fläche (Orig-px²)
+        max_area_frac: float = 0.85,         # max. Anteil am Gesamtbild
+        aspect_range: tuple[float, float] = (0.55, 5.5),  # h/w (Mensch = hoch)
+        min_fill_ratio: float = 0.015,       # es muss eine Linie da sein
+        max_fill_ratio: float = 0.45,        # darüber = "fette Ummantellung"
+        # --- Verbindung der zerrissenen Outline ---
+        connect_ksize: int = 5,              # Dilations-Kernel (verbindet Lücken)
+        connect_iter: int = 2,               # mehr = größere Lücken überbrückt
+        merge_gap: int = 22,                 # Boxen näher als das verschmelzen
+        # --- Performance / Region ---
         downscale: float = 1.0,
-        roi: tuple[float, float, float, float] | None = None,
+        # ROI blendet das HUD am Rand aus (oben Objective/Timer, unten
+        # Health/Ability-Bar, seitlich Portraits/Killfeed). Default deckt die
+        # zentrale Spielfläche ab; None = ganzes Bild.
+        roi: tuple[float, float, float, float] | None = (0.05, 0.08, 0.90, 0.75),
         use_cuda: bool = False,
     ) -> None:
         self.lower1 = np.array(lower1, dtype=np.uint8)
         self.upper1 = np.array(upper1, dtype=np.uint8)
         self.lower2 = np.array(lower2, dtype=np.uint8)
         self.upper2 = np.array(upper2, dtype=np.uint8)
+
         self.min_area = min_area
+        self.max_area_frac = max_area_frac
+        self.aspect_range = aspect_range
+        self.min_fill_ratio = min_fill_ratio
         self.max_fill_ratio = max_fill_ratio
+
+        self.connect_iter = connect_iter
+        self.merge_gap = merge_gap
+        self._connect_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (connect_ksize, connect_ksize)
+        )
+
         self.downscale = max(0.05, min(1.0, downscale))
         self.roi = roi
-        self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
         # GPU-Backend ermitteln
         self._cuda_backend: str | None = None
         if use_cuda:
-            if _TORCH:
-                import torch
-                if torch.cuda.is_available():
-                    self._cuda_backend = "torch"
-                    print(f"GPU aktiv (PyTorch): {torch.cuda.get_device_name(0)}")
-            if self._cuda_backend is None:
+            if _TORCH and torch.cuda.is_available():
+                self._cuda_backend = "torch"
+                print(f"GPU aktiv (PyTorch): {torch.cuda.get_device_name(0)}")
+            else:
                 try:
                     if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-                        self._gpu_morph = cv2.cuda.createMorphologyFilter(
-                            cv2.MORPH_OPEN, cv2.CV_8UC1, self._kernel
-                        )
                         self._cuda_backend = "cv2"
                         print("GPU aktiv (cv2.cuda)")
                 except (cv2.error, AttributeError):
@@ -157,7 +187,7 @@ class RedOutlineDetector:
                 )
 
     # ------------------------------------------------------------------
-    # Hilfsmethoden
+    # ROI
     # ------------------------------------------------------------------
 
     def _roi_px(self, frame: np.ndarray) -> tuple[int, int, int, int]:
@@ -168,56 +198,79 @@ class RedOutlineDetector:
         return (int(rx * w), int(ry * h), int(rw * w), int(rh * h))
 
     # ------------------------------------------------------------------
-    # CPU-Pfad
+    # Farb-Maske (core) – CPU + GPU, OHNE Morphologie (Linie bleibt dünn)
     # ------------------------------------------------------------------
 
-    def red_mask(self, frame: np.ndarray) -> np.ndarray:
-        """Binäre Maske aller roten/pinken Pixel (CPU)."""
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    def _color_mask_cpu(self, bgr: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.lower1, self.upper1)
         mask |= cv2.inRange(hsv, self.lower2, self.upper2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._kernel)
         return mask
 
-    # ------------------------------------------------------------------
-    # GPU-Pfade
-    # ------------------------------------------------------------------
-
-    def _mask_torch(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
-        """GPU-Pfad via PyTorch: Resize + HSV + Masken auf CUDA."""
-        import torch
-        scale = self.downscale
-        gpu = torch.from_numpy(frame).cuda()           # H, W, 3 uint8
-        if scale < 1.0:
-            t = gpu.float().permute(2, 0, 1).unsqueeze(0)
-            nh, nw = int(frame.shape[0] * scale), int(frame.shape[1] * scale)
-            t = _F.interpolate(t, (nh, nw), mode="area")
-            gpu = t.squeeze(0).permute(1, 2, 0).byte()
+    def _color_mask_torch(self, bgr: np.ndarray) -> np.ndarray:
+        gpu = torch.from_numpy(bgr).cuda()
         hsv = _bgr_to_hsv_torch(gpu)
-        lo1 = torch.tensor(self.lower1, device="cuda").float()
-        hi1 = torch.tensor(self.upper1, device="cuda").float()
-        lo2 = torch.tensor(self.lower2, device="cuda").float()
-        hi2 = torch.tensor(self.upper2, device="cuda").float()
-        m1 = ((hsv >= lo1) & (hsv <= hi1)).all(2)
-        m2 = ((hsv >= lo2) & (hsv <= hi2)).all(2)
-        mask_gpu = (m1 | m2).float()
-        mask_gpu = _morph_open_torch(mask_gpu)
-        return (mask_gpu.cpu().numpy() * 255).astype(np.uint8), 1.0 / scale
+        lo1 = torch.tensor(self.lower1, device="cuda", dtype=torch.float32)
+        hi1 = torch.tensor(self.upper1, device="cuda", dtype=torch.float32)
+        lo2 = torch.tensor(self.lower2, device="cuda", dtype=torch.float32)
+        hi2 = torch.tensor(self.upper2, device="cuda", dtype=torch.float32)
+        m1 = ((hsv >= lo1) & (hsv <= hi1)).all(dim=2)
+        m2 = ((hsv >= lo2) & (hsv <= hi2)).all(dim=2)
+        mask = (m1 | m2)
+        return (mask.to(torch.uint8) * 255).cpu().numpy()
 
-    def _mask_cv2cuda(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
-        """GPU-Pfad via cv2.cuda."""
-        scale = self.downscale
+    def _color_mask_cv2cuda(self, bgr: np.ndarray) -> np.ndarray:
         gpu = cv2.cuda_GpuMat()
-        gpu.upload(frame)
-        if scale < 1.0:
-            nw, nh = int(frame.shape[1] * scale), int(frame.shape[0] * scale)
-            gpu = cv2.cuda.resize(gpu, (nw, nh), interpolation=cv2.INTER_AREA)
+        gpu.upload(bgr)
         gpu_hsv = cv2.cuda.cvtColor(gpu, cv2.COLOR_BGR2HSV)
         m1 = cv2.cuda.inRange(gpu_hsv, self.lower1, self.upper1)
         m2 = cv2.cuda.inRange(gpu_hsv, self.lower2, self.upper2)
-        gpu_mask = cv2.cuda.bitwise_or(m1, m2)
-        gpu_mask = self._gpu_morph.apply(gpu_mask)
-        return gpu_mask.download(), 1.0 / scale
+        return cv2.cuda.bitwise_or(m1, m2).download()
+
+    def _core_mask(self, bgr: np.ndarray) -> np.ndarray:
+        if self._cuda_backend == "torch":
+            return self._color_mask_torch(bgr)
+        if self._cuda_backend == "cv2":
+            return self._color_mask_cv2cuda(bgr)
+        return self._color_mask_cpu(bgr)
+
+    def red_mask(self, frame: np.ndarray) -> np.ndarray:
+        """Öffentliche Farb-Maske (für Tuning-Tool) – volle Auflösung, CPU."""
+        return self._color_mask_cpu(frame)
+
+    # ------------------------------------------------------------------
+    # Bounding-Boxen verschmelzen (Fragmente einer Outline -> 1 Charakter)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_boxes(
+        boxes: list[tuple[int, int, int, int]], gap: int
+    ) -> list[tuple[int, int, int, int]]:
+        """Vereint Boxen, die sich überlappen oder näher als `gap` liegen."""
+        boxes = list(boxes)
+        changed = True
+        while changed:
+            changed = False
+            out: list[tuple[int, int, int, int]] = []
+            while boxes:
+                x, y, w, h = boxes.pop()
+                x2, y2 = x + w, y + h
+                i = 0
+                while i < len(out):
+                    ox, oy, ow, oh = out[i]
+                    ox2, oy2 = ox + ow, oy + oh
+                    if (x < ox2 + gap and ox < x2 + gap
+                            and y < oy2 + gap and oy < y2 + gap):
+                        x, y = min(x, ox), min(y, oy)
+                        x2, y2 = max(x2, ox2), max(y2, oy2)
+                        out.pop(i)
+                        changed = True
+                        i = 0
+                        continue
+                    i += 1
+                out.append((x, y, x2 - x, y2 - y))
+            boxes = out
+        return boxes
 
     # ------------------------------------------------------------------
     # Haupt-Detektion
@@ -226,45 +279,63 @@ class RedOutlineDetector:
     def detect(
         self, frame: np.ndarray, outlines_only: bool = True
     ) -> list[OutlineDetection]:
+        """Erkennt Gegner-Outlines. `outlines_only` bleibt aus Kompatibilität;
+        es werden ohnehin nur dünne, charakterförmige Outlines zurückgegeben."""
         rx, ry, rw, rh = self._roi_px(frame)
         cropped = frame[ry:ry + rh, rx:rx + rw]
 
-        if self._cuda_backend == "torch":
-            mask, inv_scale = self._mask_torch(cropped)
-        elif self._cuda_backend == "cv2":
-            mask, inv_scale = self._mask_cv2cuda(cropped)
+        scale = self.downscale
+        if scale < 1.0:
+            small = cv2.resize(cropped, None, fx=scale, fy=scale,
+                               interpolation=cv2.INTER_AREA)
         else:
-            scale = self.downscale
-            small = (cv2.resize(cropped, None, fx=scale, fy=scale,
-                                interpolation=cv2.INTER_AREA)
-                     if scale < 1.0 else cropped)
-            mask = self.red_mask(small)
-            inv_scale = 1.0 / scale
+            small = cropped
+        inv_scale = 1.0 / scale
 
+        # 1) dünne Farb-Maske
+        core = self._core_mask(small)
+
+        # 2) Lücken überbrücken: reine Dilation verbindet die zerrissene
+        #    Outline (CLOSE würde die Brücken sofort wieder wegerodieren).
+        connected = cv2.dilate(core, self._connect_kernel,
+                               iterations=self.connect_iter)
+
+        # 3) Fragment-Boxen holen und zu Charakter-Boxen verschmelzen.
         contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
+        raw = [cv2.boundingRect(c) for c in contours]
+        raw = [b for b in raw if b[2] > 1 and b[3] > 1]
+        boxes = self._merge_boxes(raw, self.merge_gap)
 
-        detections: list[OutlineDetection] = []
         frame_area = frame.shape[0] * frame.shape[1]
+        detections: list[OutlineDetection] = []
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area:
+        for (x, y, w, h) in boxes:
+            if w == 0 or h == 0:
                 continue
 
-            x, y, w, h = cv2.boundingRect(cnt)
+            box_area_orig = (w * h) * inv_scale * inv_scale
 
-            # Bounding-Box darf nicht den ganzen Frame füllen
-            if (w * h * inv_scale * inv_scale) > frame_area * 0.5:
+            # --- Größe ---
+            if box_area_orig < self.min_area:
+                continue
+            if box_area_orig > frame_area * self.max_area_frac:
                 continue
 
-            roi_mask = mask[y:y + h, x:x + w]
-            box_area = w * h
-            fill_ratio = (cv2.countNonZero(roi_mask) / box_area) if box_area else 0.0
-            is_outline = fill_ratio <= self.max_fill_ratio
+            # --- Form: Seitenverhältnis (Mensch ist hoch) ---
+            aspect = h / w
+            if not (self.aspect_range[0] <= aspect <= self.aspect_range[1]):
+                continue
 
-            if outlines_only and not is_outline:
+            # --- Thinness: Outline = dünne Linie, keine "fette Ummantellung" ---
+            # Auf der CORE-Maske gemessen, damit das CLOSE nicht verfälscht.
+            core_box = core[y:y + h, x:x + w]
+            red_px = cv2.countNonZero(core_box)
+            fill_ratio = red_px / float(w * h)
+            if fill_ratio < self.min_fill_ratio:
+                continue
+            if fill_ratio > self.max_fill_ratio:
                 continue
 
             box = (
@@ -274,10 +345,11 @@ class RedOutlineDetector:
             detections.append(
                 OutlineDetection(
                     box=box,
-                    area=area * inv_scale * inv_scale,
+                    area=box_area_orig,
                     fill_ratio=fill_ratio,
-                    is_outline=is_outline,
-                    contour=cnt,
+                    aspect=aspect,
+                    is_outline=True,
+                    contour=None,
                 )
             )
         return detections

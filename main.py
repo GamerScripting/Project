@@ -39,24 +39,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Max. Rot-Anteil in der Box, damit es als Outline gilt (0..1)")
     p.add_argument("--downscale", type=float, default=1.0,
                    help="Frame vor Outline-Analyse verkleinern (z. B. 0.5 = schneller)")
-    p.add_argument("--min-area", type=int, default=120,
-                   help="Mindestfläche einer Kontur in Pixel²")
+    p.add_argument("--min-area", type=int, default=350,
+                   help="Mindest-Bounding-Box-Fläche in Pixel²")
     p.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"),
                    default=None,
-                   help="Detection-Region als Anteile 0..1, z. B. 0 0.15 1 0.7 "
-                        "(blendet oberes/unteres HUD aus)")
+                   help="Detection-Region als Anteile 0..1, z. B. 0 0.15 1 0.7. "
+                        "Ohne Angabe gilt der HUD-Default 0.05 0.08 0.90 0.75.")
+    p.add_argument("--no-roi", action="store_true",
+                   help="ROI abschalten – ganzes Bild analysieren (inkl. HUD)")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
+    # ROI-Auflösung: --no-roi = ganzes Bild, --roi X Y W H überschreibt,
+    # sonst greift der HUD-Default (zentrale Spielfläche).
+    if args.no_roi:
+        roi = None
+    elif args.roi:
+        roi = tuple(args.roi)
+    else:
+        roi = (0.05, 0.08, 0.90, 0.75)
+
     pipeline = DetectionPipeline(
         outline_detector=RedOutlineDetector(
             min_area=args.min_area,
             max_fill_ratio=args.fill_ratio,
             downscale=args.downscale,
-            roi=tuple(args.roi) if args.roi else None,
+            roi=roi,
             use_cuda=args.cuda,
         ),
         movement_detector=MovementDetector(),
