@@ -57,13 +57,17 @@ class RedOutlineDetector:
 
     def __init__(
         self,
-        lower1: tuple[int, int, int] = (0, 120, 80),
-        upper1: tuple[int, int, int] = (10, 255, 255),
-        lower2: tuple[int, int, int] = (170, 120, 80),
+        # Default deckt Orange BIS Rot ab (Hue 0–20), passend zu orangen
+        # Glow-Outlines. Massive rote/orange Flächen (Health-Bars) fängt die
+        # Füllrate ab, nicht die Farbe.
+        lower1: tuple[int, int, int] = (0, 90, 90),
+        upper1: tuple[int, int, int] = (20, 255, 255),
+        lower2: tuple[int, int, int] = (170, 90, 90),
         upper2: tuple[int, int, int] = (180, 255, 255),
         min_area: int = 120,
         max_fill_ratio: float = 0.35,
         downscale: float = 1.0,
+        roi: tuple[float, float, float, float] | None = None,
     ) -> None:
         self.lower1 = np.array(lower1, dtype=np.uint8)
         self.upper1 = np.array(upper1, dtype=np.uint8)
@@ -72,7 +76,19 @@ class RedOutlineDetector:
         self.min_area = min_area
         self.max_fill_ratio = max_fill_ratio
         self.downscale = max(0.05, min(1.0, downscale))
+        # ROI als relative Anteile (x, y, w, h) in 0..1 – z. B. (0, 0.15, 1, 0.7)
+        # blendet oberes und unteres HUD aus. None = ganzes Bild.
+        self.roi = roi
         self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    def _roi_px(self, frame: np.ndarray) -> tuple[int, int, int, int]:
+        """Rechnet die relative ROI in Pixel um (oder volles Bild)."""
+        h, w = frame.shape[:2]
+        if self.roi is None:
+            return (0, 0, w, h)
+        rx, ry, rw, rh = self.roi
+        x0, y0 = int(rx * w), int(ry * h)
+        return (x0, y0, int(rw * w), int(rh * h))
 
     def red_mask(self, frame: np.ndarray) -> np.ndarray:
         """Binäre Maske aller roten Pixel (beide Hue-Bereiche kombiniert)."""
@@ -92,12 +108,16 @@ class RedOutlineDetector:
         Args:
             outlines_only: Wenn True, werden massive rote Objekte herausgefiltert.
         """
+        # Auf die ROI zuschneiden (HUD ausblenden + schneller).
+        rx, ry, rw, rh = self._roi_px(frame)
+        cropped = frame[ry:ry + rh, rx:rx + rw]
+
         scale = self.downscale
         if scale < 1.0:
-            small = cv2.resize(frame, None, fx=scale, fy=scale,
+            small = cv2.resize(cropped, None, fx=scale, fy=scale,
                                interpolation=cv2.INTER_AREA)
         else:
-            small = frame
+            small = cropped
 
         mask = self.red_mask(small)
         contours, _ = cv2.findContours(
@@ -121,9 +141,9 @@ class RedOutlineDetector:
             if outlines_only and not is_outline:
                 continue
 
-            # Box zurück auf Originalauflösung skalieren.
+            # Box zurück auf Originalauflösung skalieren + ROI-Offset addieren.
             box = (
-                int(x * inv_scale), int(y * inv_scale),
+                int(x * inv_scale) + rx, int(y * inv_scale) + ry,
                 int(w * inv_scale), int(h * inv_scale),
             )
             detections.append(

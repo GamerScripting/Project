@@ -38,6 +38,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Frame vor Outline-Analyse verkleinern (z. B. 0.5 = schneller)")
     p.add_argument("--min-area", type=int, default=120,
                    help="Mindestfläche einer Kontur in Pixel²")
+    p.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"),
+                   default=None,
+                   help="Detection-Region als Anteile 0..1, z. B. 0 0.15 1 0.7 "
+                        "(blendet oberes/unteres HUD aus)")
     return p.parse_args(argv)
 
 
@@ -49,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
             min_area=args.min_area,
             max_fill_ratio=args.fill_ratio,
             downscale=args.downscale,
+            roi=tuple(args.roi) if args.roi else None,
         ),
         movement_detector=MovementDetector(),
         tag_detector=TagDetector(gpu=args.gpu),
