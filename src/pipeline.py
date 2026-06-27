@@ -1,4 +1,15 @@
-"""Führt Outline-, Tag- und Movement-Erkennung zusammen und zeichnet Overlays."""
+"""Führt Outline-, Tag- und Bewegungs-Verifikation zusammen und zeichnet Overlays.
+
+Kombination Farbe + Bewegung (gezielt, nicht global):
+- FARBE+FORM findet rote Gegner-Outline-Kandidaten (kann auf statisches
+  Rot/Deko anspringen).
+- Pro Kandidat prüft der MotionVerifier, ob er sich anders bewegt als seine
+  Umgebung (siehe movement.py). Nur dann gilt er als bewegter Gegner.
+
+Darstellung:
+    * nur Farbe (statisch)     -> orange
+    * Farbe + Bewegung (Gegner)-> grün (dick, "GEGNER")
+"""
 
 from __future__ import annotations
 
@@ -7,7 +18,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .movement import MovementDetector, MovementRegion
+from .movement import MotionVerifier, MovementRegion
 from .outlines import OutlineDetection, RedOutlineDetector
 from .tags import TagDetection, TagDetector
 
@@ -18,15 +29,19 @@ class FrameResult:
 
     outlines: list[OutlineDetection] = field(default_factory=list)
     tags: list[TagDetection] = field(default_factory=list)
-    movements: list[MovementRegion] = field(default_factory=list)
+    movements: list[MovementRegion] = field(default_factory=list)  # bewegte Outlines
     frame_id: int = 0
+
+    def confirmed_boxes(self) -> list[tuple[int, int, int, int]]:
+        """Boxen, die per Farbe UND Bewegung bestätigt sind (= Gegner)."""
+        return [m.box for m in self.movements]
 
     def to_dict(self) -> dict:
         """Kompaktes Dict – genau das, was später über LAN an PC2 geht."""
         return {
             "frame": self.frame_id,
             "outlines": [o.to_dict() for o in self.outlines],
-            "movements": [m.to_dict() for m in self.movements],
+            "confirmed": [list(b) for b in self.confirmed_boxes()],
             "tags": [t.to_dict() for t in self.tags],
         }
 
@@ -36,63 +51,85 @@ class FrameResult:
 
 
 class DetectionPipeline:
-    """Kombiniert alle Detektoren. Die OCR ist optional (langsam)."""
+    """Kombiniert Farb-Outlines, Bewegungs-Verifikation und (optional) OCR."""
 
     # BGR-Farben für die Overlays
-    COLOR_OUTLINE = (0, 255, 0)    # grün  = echte Outline
-    COLOR_SOLID = (0, 165, 255)    # orange = massives rotes Objekt (verworfen)
+    COLOR_ONLY = (0, 140, 255)     # orange = nur Farbe (statisch)
+    CONFIRMED = (0, 255, 0)        # grün   = Farbe + Bewegung = Gegner
     COLOR_TAG = (255, 180, 0)      # cyan/blau
-    COLOR_MOVE = (0, 0, 255)       # rot
 
     def __init__(
         self,
         outline_detector: RedOutlineDetector | None = None,
-        movement_detector: MovementDetector | None = None,
+        motion_verifier: MotionVerifier | None = None,
         tag_detector: TagDetector | None = None,
         use_ocr: bool = True,
+        use_motion: bool = True,
         outlines_only: bool = True,
     ) -> None:
         self.outlines = outline_detector or RedOutlineDetector()
-        self.movement = movement_detector or MovementDetector()
+        self.motion = motion_verifier or MotionVerifier()
         self.tags = tag_detector or TagDetector()
         self.use_ocr = use_ocr
-        # outlines_only=False behalten, um echte Outlines visuell von massiven
-        # roten Objekten unterscheiden zu können (Debug). True = nur Outlines.
+        self.use_motion = use_motion
         self.outlines_only = outlines_only
 
     def process(self, frame: np.ndarray) -> FrameResult:
         result = FrameResult()
         result.outlines = self.outlines.detect(frame, outlines_only=self.outlines_only)
-        result.movements = self.movement.detect(frame)
+
+        if self.use_motion:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if result.outlines:
+                self.motion.update(gray)              # teurer Fluss nur bei Bedarf
+                result.movements = [
+                    MovementRegion(box=o.box, area=o.area)
+                    for o in result.outlines
+                    if self.motion.is_moving(o.box)
+                ]
+            else:
+                self.motion.note_frame(gray)          # nur Frame merken
+
         if self.use_ocr:
             result.tags = self.tags.detect(frame)
         return result
 
-    def draw(self, frame: np.ndarray, result: FrameResult, show_movement: bool = False) -> np.ndarray:
-        """Zeichnet alle Erkennungen als Overlay auf eine Kopie des Frames."""
+    def draw(self, frame: np.ndarray, result: FrameResult, show_movement: bool = True) -> np.ndarray:
+        """Zeichnet Outlines. Mit Bewegungs-Verifikation werden bewegte
+        Gegner (grün) von statischem Rot (orange) getrennt."""
         out = frame.copy()
-
-        if show_movement:
-            for m in result.movements:
-                x, y, w, h = m.box
-                cv2.rectangle(out, (x, y), (x + w, y + h), self.COLOR_MOVE, 1)
+        confirmed = set(result.confirmed_boxes())
 
         for o in result.outlines:
             x, y, w, h = o.box
-            color = self.COLOR_OUTLINE if o.is_outline else self.COLOR_SOLID
-            cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+            is_conf = show_movement and o.box in confirmed
+            color = self.CONFIRMED if is_conf else self.COLOR_ONLY
+            thick = 3 if is_conf else 2
+            cv2.rectangle(out, (x, y), (x + w, y + h), color, thick)
+            if is_conf:
+                cv2.putText(out, "GEGNER", (x, max(0, y - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.CONFIRMED, 2,
+                            cv2.LINE_AA)
 
+        if show_movement:
+            self._draw_legend(out)
+        self._draw_tags(out, result)
+        return out
+
+    def _draw_legend(self, out: np.ndarray) -> None:
+        items = [("nur Farbe (statisch)", self.COLOR_ONLY),
+                 ("Gegner (bewegt)", self.CONFIRMED)]
+        y = 24
+        for text, color in items:
+            cv2.rectangle(out, (12, y - 12), (28, y + 2), color, -1)
+            cv2.putText(out, text, (34, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        color, 2, cv2.LINE_AA)
+            y += 26
+
+    def _draw_tags(self, out: np.ndarray, result: FrameResult) -> None:
         for t in result.tags:
             x, y, w, h = t.box
             cv2.rectangle(out, (x, y), (x + w, y + h), self.COLOR_TAG, 2)
-            cv2.putText(
-                out,
-                t.text,
-                (x, max(0, y - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                self.COLOR_TAG,
-                2,
-                cv2.LINE_AA,
-            )
-        return out
+            cv2.putText(out, t.text, (x, max(0, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.COLOR_TAG, 2,
+                        cv2.LINE_AA)

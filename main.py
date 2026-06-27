@@ -9,7 +9,7 @@ import time
 import cv2
 
 from src.capture import VideoSource
-from src.movement import MovementDetector
+from src.movement import MotionVerifier
 from src.outlines import RedOutlineDetector
 from src.pipeline import DetectionPipeline
 from src.tags import TagDetector
@@ -18,7 +18,8 @@ from src.tags import TagDetector
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Rote Outlines / Tags / Movement im Video erkennen.")
     p.add_argument("--video", required=True, help="Pfad zur Videodatei")
-    p.add_argument("--skip", type=int, default=1, help="Nur jeden N-ten Frame analysieren")
+    p.add_argument("--skip", type=int, default=3,
+                   help="Nur jeden N-ten Frame analysieren (Default 3 = schneller)")
     p.add_argument("--start", type=float, default=0.0, help="Bei Sekunde X ins Video einsteigen")
     p.add_argument("--max-frames", type=int, default=None,
                    help="Höchstens N Frames verarbeiten (gut zum Tunen großer Dateien)")
@@ -28,7 +29,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Outline-Detection auf der NVIDIA-GPU (CUDA) beschleunigen")
     p.add_argument("--save", help="Annotiertes Ergebnis als Videodatei speichern")
     p.add_argument("--no-window", action="store_true", help="Kein Vorschaufenster anzeigen")
-    p.add_argument("--no-movement", action="store_true", help="Bewegungsboxen nicht anzeigen")
+    p.add_argument("--no-motion", action="store_true",
+                   help="Bewegungs-Verifikation aus (alle Outlines orange)")
     p.add_argument("--show-solid", action="store_true",
                    help="Massive rote Objekte mit anzeigen (orange) statt verwerfen")
     p.add_argument("--bench", action="store_true",
@@ -70,9 +72,10 @@ def main(argv: list[str] | None = None) -> int:
             roi=roi,
             use_cuda=args.cuda,
         ),
-        movement_detector=MovementDetector(),
+        motion_verifier=MotionVerifier(),
         tag_detector=TagDetector(gpu=args.gpu),
         use_ocr=not args.no_ocr,
+        use_motion=not args.no_motion,
         outlines_only=not args.show_solid,
     )
 
@@ -100,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
                           f"(outlines={len(result.outlines)}, "
                           f"moves={len(result.movements)}, tags={len(result.tags)})")
 
-                annotated = pipeline.draw(frame, result, show_movement=not args.no_movement)
+                annotated = pipeline.draw(frame, result, show_movement=not args.no_motion)
 
                 if writer is not None:
                     writer.write(annotated)
