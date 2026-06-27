@@ -74,7 +74,10 @@ class OutlineDetection:
     fill_ratio: float                # roter Pixel-Anteil in der Box (Thinness)
     aspect: float                    # Höhe / Breite
     is_outline: bool                 # immer True (Kandidat hat Filter bestanden)
-    contour: np.ndarray = field(default=None, repr=False)
+    # Echte Silhouetten-Konturen (Originalkoordinaten) zum 1:1-Nachzeichnen
+    # der roten Outline statt einer Box.
+    contours: list = field(default_factory=list, repr=False)
+    solidity: float = 1.0            # Konturfläche / Konvexhülle (Form-Maß)
 
     @property
     def center(self) -> tuple[int, int]:
@@ -124,18 +127,36 @@ class RedOutlineDetector:
     def __init__(
         self,
         # --- Farbe (HSV) ---
-        lower1: tuple[int, int, int] = (0,   60, 110),
-        upper1: tuple[int, int, int] = (14, 255, 255),
-        lower2: tuple[int, int, int] = (150,  60, 110),
+        # Rot-Bereich (0-14): NUR ergänzend. Gegner-Glow ist überwiegend PINK
+        # (H 150-180); reines Rot (H~8) ist fast immer Damage-Vignette, rote
+        # Laternen/Kerzen/Deko. Deshalb hier hohe S/V-Schwelle, damit matte
+        # Rottöne (z. B. Kerze S~60) NICHT mehr durchrutschen.
+        lower1: tuple[int, int, int] = (0,  120, 120),
+        upper1: tuple[int, int, int] = (10, 255, 255),
+        # Pink/Magenta = das eigentliche Gegner-Signal, S-Schwelle moderat.
+        lower2: tuple[int, int, int] = (150,  70, 110),
         upper2: tuple[int, int, int] = (180, 255, 255),
-        # --- Form ---
-        min_area: int = 350,                 # min. Bounding-Box-Fläche (Orig-px²)
-        max_area_frac: float = 0.85,         # max. Anteil am Gesamtbild
-        # h/w. Großzügig: Gegner können in dynamischen Posen liegen/fliegen
-        # (geworfen, springend). Blockt nur extreme HUD-Balken (sehr breit/dünn).
-        aspect_range: tuple[float, float] = (0.3, 7.0),
-        min_fill_ratio: float = 0.015,       # es muss eine Linie da sein
-        max_fill_ratio: float = 0.45,        # darüber = "fette Ummantellung"
+        # --- Form (auf "generische Spielerform/-größe" getrimmt) ---
+        min_area: int = 900,                 # min. Bounding-Box-Fläche (Orig-px²)
+        # Ein einzelner Spieler füllt nie den halben Screen. Klein halten,
+        # damit Vignette/zusammengemergte Effekt-Flecken rausfallen.
+        max_area_frac: float = 0.12,         # max. Anteil am Gesamtbild
+        max_w_frac: float = 0.30,            # max. Box-Breite als Bildanteil
+        max_h_frac: float = 0.75,            # max. Box-Höhe als Bildanteil
+        # h/w. Ein Spieler steht ~aufrecht (aspect >= ~1). Breite Wolken
+        # (Kirschblüten ~0.4-0.9, Lotus ~0.5) fallen raus. Untergrenze 0.9
+        # ist der Preis dafür, dass liegende/geworfene Gegner verfehlt werden
+        # können – bewusst zugunsten der Präzision (kein Blüten-Spam).
+        aspect_range: tuple[float, float] = (0.9, 4.0),
+        # dichte rote Flächen (VFX-Bursts, gefüllte Deko) raus; eine echte
+        # Outline ist eine dünne Linie -> niedrige Füllrate (~0.12-0.25).
+        min_fill_ratio: float = 0.12,        # darunter = spärlich (Blüten-Rand)
+        max_fill_ratio: float = 0.35,        # darüber = "fette Ummantellung"/VFX
+        # Solidity = Konturfläche / Konvexhülle. Ein Charakter-Loop ist
+        # zusammenhängend-kompakt; zerfaserte/sternförmige VFX-Bursts und
+        # verstreute Deko haben eine löchrige Hülle -> niedrige Solidity.
+        # 0.0 = aus. ~0.3 verwirft nur extrem zerfranste Formen.
+        min_solidity: float = 0.30,
         # --- Verbindung der zerrissenen Outline ---
         connect_ksize: int = 5,              # Dilations-Kernel (verbindet Lücken)
         connect_iter: int = 2,               # mehr = größere Lücken überbrückt
@@ -155,9 +176,12 @@ class RedOutlineDetector:
 
         self.min_area = min_area
         self.max_area_frac = max_area_frac
+        self.max_w_frac = max_w_frac
+        self.max_h_frac = max_h_frac
         self.aspect_range = aspect_range
         self.min_fill_ratio = min_fill_ratio
         self.max_fill_ratio = max_fill_ratio
+        self.min_solidity = min_solidity
 
         self.connect_iter = connect_iter
         self.merge_gap = merge_gap
@@ -302,15 +326,23 @@ class RedOutlineDetector:
         connected = cv2.dilate(core, self._connect_kernel,
                                iterations=self.connect_iter)
 
-        # 3) Fragment-Boxen holen und zu Charakter-Boxen verschmelzen.
+        # 3) Fragment-Boxen + zugehörige Konturen holen und die Boxen zu
+        #    Charakter-Boxen verschmelzen. Die Konturen behalten wir, um die
+        #    Outline später 1:1 nachzuzeichnen (statt nur einer Box).
         contours, _ = cv2.findContours(
             connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        raw = [cv2.boundingRect(c) for c in contours]
-        raw = [b for b in raw if b[2] > 1 and b[3] > 1]
+        # (rect, contour)-Paare; Mini-Fragmente verwerfen.
+        frags = []
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw > 1 and bh > 1:
+                frags.append(((bx, by, bw, bh), c))
+        raw = [r for r, _ in frags]
         boxes = self._merge_boxes(raw, self.merge_gap)
 
-        frame_area = frame.shape[0] * frame.shape[1]
+        frame_h, frame_w = frame.shape[:2]
+        frame_area = frame_h * frame_w
         detections: list[OutlineDetection] = []
 
         for (x, y, w, h) in boxes:
@@ -318,11 +350,19 @@ class RedOutlineDetector:
                 continue
 
             box_area_orig = (w * h) * inv_scale * inv_scale
+            w_orig = w * inv_scale
+            h_orig = h * inv_scale
 
             # --- Größe ---
             if box_area_orig < self.min_area:
                 continue
             if box_area_orig > frame_area * self.max_area_frac:
+                continue
+            # Dimensions-Caps: eine bildschirm-spannende Box (Damage-Vignette,
+            # zusammengemergte Effekt-Flecken) ist kein einzelner Gegner.
+            if w_orig > frame_w * self.max_w_frac:
+                continue
+            if h_orig > frame_h * self.max_h_frac:
                 continue
 
             # --- Form: Seitenverhältnis (Mensch ist hoch) ---
@@ -340,6 +380,32 @@ class RedOutlineDetector:
             if fill_ratio > self.max_fill_ratio:
                 continue
 
+            # --- Member-Konturen einsammeln (die in diese Box fallen) ---
+            bx2, by2 = x + w, y + h
+            members = [
+                c for (fx, fy, fw, fh), c in frags
+                if fx < bx2 and x < fx + fw and fy < by2 and y < fy + fh
+            ]
+            if not members:
+                continue
+
+            # --- Form: Solidity der größten Member-Kontur ---
+            # (Charakter-Loop = kompakt; sternförmige VFX = zerfasert.)
+            biggest = max(members, key=cv2.contourArea)
+            c_area = cv2.contourArea(biggest)
+            hull_area = cv2.contourArea(cv2.convexHull(biggest))
+            solidity = c_area / hull_area if hull_area > 0 else 0.0
+            if self.min_solidity > 0.0 and solidity < self.min_solidity:
+                continue
+
+            # Konturen in Originalkoordinaten umrechnen (Downscale + ROI).
+            scaled = []
+            for c in members:
+                cc = c.astype(np.float32)
+                cc[:, :, 0] = cc[:, :, 0] * inv_scale + rx
+                cc[:, :, 1] = cc[:, :, 1] * inv_scale + ry
+                scaled.append(cc.astype(np.int32))
+
             box = (
                 int(x * inv_scale) + rx, int(y * inv_scale) + ry,
                 int(w * inv_scale), int(h * inv_scale),
@@ -351,7 +417,8 @@ class RedOutlineDetector:
                     fill_ratio=fill_ratio,
                     aspect=aspect,
                     is_outline=True,
-                    contour=None,
+                    contours=scaled,
+                    solidity=solidity,
                 )
             )
         return detections

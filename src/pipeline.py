@@ -95,18 +95,38 @@ class DetectionPipeline:
         return result
 
     def draw(self, frame: np.ndarray, result: FrameResult, show_movement: bool = True) -> np.ndarray:
-        """Zeichnet Outlines. Mit Bewegungs-Verifikation werden bewegte
-        Gegner (grün) von statischem Rot (orange) getrennt."""
+        """Zeichnet die erkannte rote Outline 1:1 nach (echte Silhouette statt
+        Box). Mit Bewegungs-Verifikation: bewegter Gegner grün, statisches
+        Rot orange."""
         out = frame.copy()
         confirmed = set(result.confirmed_boxes())
 
+        def is_confirmed(o) -> bool:
+            return show_movement and o.box in confirmed
+
+        # Dezente, halbtransparente Füllung der bestätigten Gegner-Silhouetten,
+        # damit sie hervorstechen (ein addWeighted-Pass für alle zusammen).
+        conf_contours = [
+            c for o in result.outlines if is_confirmed(o) for c in o.contours
+        ]
+        if conf_contours:
+            overlay = out.copy()
+            cv2.drawContours(overlay, conf_contours, -1, self.CONFIRMED, cv2.FILLED)
+            cv2.addWeighted(overlay, 0.25, out, 0.75, 0, out)
+
+        # Outline nachzeichnen.
         for o in result.outlines:
-            x, y, w, h = o.box
-            is_conf = show_movement and o.box in confirmed
+            is_conf = is_confirmed(o)
             color = self.CONFIRMED if is_conf else self.COLOR_ONLY
-            thick = 3 if is_conf else 2
-            cv2.rectangle(out, (x, y), (x + w, y + h), color, thick)
+            thick = 2 if is_conf else 1
+            if o.contours:
+                cv2.polylines(out, o.contours, isClosed=True, color=color,
+                              thickness=thick, lineType=cv2.LINE_AA)
+            else:  # Fallback (sollte nicht vorkommen)
+                x, y, w, h = o.box
+                cv2.rectangle(out, (x, y), (x + w, y + h), color, thick)
             if is_conf:
+                x, y, _, _ = o.box
                 cv2.putText(out, "GEGNER", (x, max(0, y - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.CONFIRMED, 2,
                             cv2.LINE_AA)

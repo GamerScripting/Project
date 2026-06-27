@@ -42,9 +42,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Outline-Trennung & Geschwindigkeit
     p.add_argument("--fill-ratio", type=float, default=0.35,
                    help="Max. Rot-Anteil in der Box, damit es als Outline gilt (0..1)")
+    p.add_argument("--min-fill", type=float, default=0.12,
+                   help="Min. Rot-Anteil – darunter = spärlich (z. B. Blüten-Rand)")
+    p.add_argument("--aspect-min", type=float, default=0.9,
+                   help="Min. Höhe/Breite einer Box (Spieler steht ~aufrecht). "
+                        "Senken (~0.4), um liegende/geworfene Gegner zu fangen.")
+    p.add_argument("--aspect-max", type=float, default=4.0,
+                   help="Max. Höhe/Breite einer Box")
+    p.add_argument("--min-solidity", type=float, default=0.30,
+                   help="Min. Solidity (Konturfläche/Konvexhülle). Höher = nur "
+                        "kompakte Charakterformen, zerfaserte VFX raus. 0 = aus.")
     p.add_argument("--downscale", type=float, default=1.0,
                    help="Frame vor Outline-Analyse verkleinern (z. B. 0.5 = schneller)")
-    p.add_argument("--min-area", type=int, default=350,
+    p.add_argument("--min-area", type=int, default=900,
                    help="Mindest-Bounding-Box-Fläche in Pixel²")
     p.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"),
                    default=None,
@@ -71,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
         outline_detector=RedOutlineDetector(
             min_area=args.min_area,
             max_fill_ratio=args.fill_ratio,
+            min_fill_ratio=args.min_fill,
+            aspect_range=(args.aspect_min, args.aspect_max),
+            min_solidity=args.min_solidity,
             downscale=args.downscale,
             roi=roi,
             use_cuda=args.cuda,
