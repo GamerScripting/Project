@@ -23,6 +23,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--start", type=float, default=0.0, help="Bei Sekunde X ins Video einsteigen")
     p.add_argument("--max-frames", type=int, default=None,
                    help="Höchstens N Frames verarbeiten (gut zum Tunen großer Dateien)")
+    p.add_argument("--max-seconds", type=float, default=None,
+                   help="Nach N Sekunden Verarbeitungszeit beenden und das bis "
+                        "dahin gerenderte Video als fertig speichern")
     p.add_argument("--no-ocr", action="store_true", help="OCR (Tags) abschalten – schneller")
     p.add_argument("--gpu", action="store_true", help="EasyOCR auf der GPU laufen lassen")
     p.add_argument("--cuda", action="store_true",
@@ -91,7 +94,12 @@ def main(argv: list[str] | None = None) -> int:
                 fps = src.fps or 30.0
                 writer = cv2.VideoWriter(args.save, fourcc, fps, (w, h))
 
+            loop_start = time.perf_counter()
             for frame in src:
+                if (args.max_seconds is not None
+                        and time.perf_counter() - loop_start >= args.max_seconds):
+                    print(f"\nZeitlimit ({args.max_seconds:.0f}s) erreicht – beende.")
+                    break
                 t0 = time.perf_counter()
                 result = pipeline.process(frame)
                 dt_ms = (time.perf_counter() - t0) * 1000.0
