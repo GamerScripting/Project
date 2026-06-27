@@ -131,7 +131,9 @@ class RedOutlineDetector:
         # --- Form ---
         min_area: int = 350,                 # min. Bounding-Box-Fläche (Orig-px²)
         max_area_frac: float = 0.85,         # max. Anteil am Gesamtbild
-        aspect_range: tuple[float, float] = (0.55, 5.5),  # h/w (Mensch = hoch)
+        # h/w. Großzügig: Gegner können in dynamischen Posen liegen/fliegen
+        # (geworfen, springend). Blockt nur extreme HUD-Balken (sehr breit/dünn).
+        aspect_range: tuple[float, float] = (0.3, 7.0),
         min_fill_ratio: float = 0.015,       # es muss eine Linie da sein
         max_fill_ratio: float = 0.45,        # darüber = "fette Ummantellung"
         # --- Verbindung der zerrissenen Outline ---
