@@ -32,6 +32,7 @@ class MovementRegion:
 
     box: tuple[int, int, int, int]  # x, y, w, h
     area: float
+    score: float = 0.0              # Bewegungs-Score 0..1 (Kontrast+Kohärenz)
 
     @property
     def center(self) -> tuple[int, int]:
@@ -63,10 +64,26 @@ class MotionVerifier:
         downscale: float = 0.5,
         min_contrast: float = 1.2,
         ring_frac: float = 0.5,
+        min_flow: float = 0.6,
+        min_coherence: float = 0.35,
+        align_deg: float = 35.0,
     ) -> None:
         self.scale = downscale
         self.min_contrast = min_contrast
         self.ring_frac = ring_frac
+        # Bewegt sich ein CHARAKTER (zusammenhängend, gleichgerichtet) oder nur
+        # ein Schatten/Lichtwechsel (inkohärenter Flacker-Fluss)?
+        #   min_flow:      ab welcher Fluss-Stärke (px im verkleinerten Bild)
+        #                  ein Pixel als "in Bewegung" zählt.
+        #   min_coherence: Anteil der Box-Pixel, die sich kräftig UND in die
+        #                  gleiche Richtung wie der Median bewegen müssen.
+        #                  Ein Schatten erzeugt verstreuten, richtungslosen
+        #                  Fluss -> niedrige Kohärenz -> verworfen.
+        #   align_deg:     max. Winkelabweichung vom Median, die noch als
+        #                  "gleiche Richtung" zählt.
+        self.min_flow = min_flow
+        self.min_coherence = min_coherence
+        self._cos_align = float(np.cos(np.deg2rad(align_deg)))
         self._prev: np.ndarray | None = None
         self._flow: np.ndarray | None = None
         # DIS-Optical-Flow ist um ein Vielfaches schneller als Farneback.
@@ -113,8 +130,13 @@ class MotionVerifier:
 
     def is_moving(self, box: tuple[int, int, int, int]) -> bool:
         """True, wenn sich `box` deutlich anders bewegt als ihr Ring."""
+        return self.evaluate(box)[0]
+
+    def evaluate(self, box: tuple[int, int, int, int]) -> tuple[bool, float]:
+        """(bewegt?, score 0..1). Der Score steigt mit Bewegungs-Kontrast UND
+        -Kohärenz; 0.0, wenn nicht als bewegt bestätigt."""
         if self._flow is None:
-            return False
+            return (False, 0.0)
         fh, fw = self._flow.shape[:2]
         s = self.scale
         x, y, w, h = box
@@ -122,7 +144,7 @@ class MotionVerifier:
         bx, by, bw, bh = int(x * s), int(y * s), int(w * s), int(h * s)
         bx2, by2 = bx + bw, by + bh
         if bw < 2 or bh < 2:
-            return False
+            return (False, 0.0)
 
         # Ring um die Box (geclippt)
         mx, my = int(bw * self.ring_frac), int(bh * self.ring_frac)
@@ -131,25 +153,62 @@ class MotionVerifier:
         bx, by = max(0, bx), max(0, by)
         bx2, by2 = min(fw, bx2), min(fh, by2)
         if bx2 <= bx or by2 <= by:
-            return False
+            return (False, 0.0)
 
         inner = self._flow[by:by2, bx:bx2].reshape(-1, 2)
         # Ring = großer Block minus Box-Bereich
         ring_block = self._flow[ry:ry2, rx:rx2].reshape(-1, 2)
         if ring_block.shape[0] <= inner.shape[0]:
-            return False
+            return (False, 0.0)
 
         in_med = self._median_flow(inner)
         # Ring-Median: nutze den ganzen Block (Box-Anteil ist klein und zieht
         # den Median kaum) – einfache, robuste Näherung.
         ring_med = self._median_flow(ring_block)
         if in_med is None or ring_med is None:
-            return False
+            return (False, 0.0)
 
         dfx = in_med[0] - ring_med[0]
         dfy = in_med[1] - ring_med[1]
         contrast = (dfx * dfx + dfy * dfy) ** 0.5
-        return contrast >= self.min_contrast
+        if contrast < self.min_contrast:
+            return (False, 0.0)
+
+        # --- Kohärenz: bewegt sich ein Charakter oder nur ein Schatten? ---
+        # Ein Charakter = zusammenhängende Fläche, die sich gleichgerichtet
+        # bewegt. Ein Schatten/Lichtwechsel erzeugt schwachen, richtungslosen
+        # Fluss. Anteil der Box-Pixel verlangen, die kräftig UND ~parallel zum
+        # Median ziehen.
+        fx = inner[:, 0]
+        fy = inner[:, 1]
+        mag = np.sqrt(fx * fx + fy * fy)
+        moving = mag >= self.min_flow
+        n_moving = int(np.count_nonzero(moving))
+        if n_moving == 0:
+            return (False, 0.0)
+        # Median-Richtung der bewegten Pixel
+        mvx = float(np.median(fx[moving]))
+        mvy = float(np.median(fy[moving]))
+        med_mag = (mvx * mvx + mvy * mvy) ** 0.5
+        if med_mag < 1e-6:
+            return (False, 0.0)
+        # Skalarprodukt der Einheitsvektoren = cos(Winkel zur Median-Richtung)
+        cos_ang = (fx * mvx + fy * mvy) / (mag * med_mag + 1e-6)
+        aligned = moving & (cos_ang >= self._cos_align)
+        coherence = np.count_nonzero(aligned) / float(inner.shape[0])
+        if coherence < self.min_coherence:
+            return (False, 0.0)
+
+        # --- Bewegungs-Score 0..1 (für Confidence) ---
+        # Wie weit über den Schwellen liegen Kohärenz und Kontrast?
+        def clamp(v: float) -> float:
+            return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
+        coh_score = clamp((coherence - self.min_coherence)
+                          / max(1e-6, 0.75 - self.min_coherence))
+        con_score = clamp((contrast - self.min_contrast) / 2.0)
+        score = 0.6 * coh_score + 0.4 * con_score
+        return (True, score)
 
     def reset(self) -> None:
         self._prev = None
